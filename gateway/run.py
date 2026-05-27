@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 
 import asyncio
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -7954,6 +7955,7 @@ class GatewayRunner:
                 message_text = await self._enrich_message_with_transcription(
                     message_text,
                     audio_paths,
+                    event=event,
                 )
                 _stt_fail_markers = (
                     "No STT provider",
@@ -14655,6 +14657,8 @@ class GatewayRunner:
         self,
         user_text: str,
         audio_paths: List[str],
+        *,
+        event: MessageEvent | None = None,
     ) -> str:
         """
         Auto-transcribe user voice/audio messages using the configured STT provider
@@ -14663,6 +14667,8 @@ class GatewayRunner:
         Args:
             user_text:   The user's original caption / message text.
             audio_paths: List of local file paths to cached audio files.
+            event:       Optional original message event, used for Discord
+                         voice-capture queue routing after STT succeeds.
 
         Returns:
             The enriched message string with transcriptions prepended.
@@ -14690,6 +14696,30 @@ class GatewayRunner:
 
         from tools.transcription_tools import transcribe_audio
 
+        capture_cfg = None
+        capture_channel_enabled = False
+        if event is not None and event.source.platform == Platform.DISCORD:
+            try:
+                from gateway.voice_capture import capture_config_from_mapping, is_channel_enabled
+
+                platform_cfg = self.config.platforms.get(Platform.DISCORD)
+                raw_capture_cfg = {}
+                if platform_cfg and isinstance(platform_cfg.extra, dict):
+                    candidate = platform_cfg.extra.get("voice_capture_queue")
+                    if isinstance(candidate, dict):
+                        raw_capture_cfg = candidate
+                capture_cfg = capture_config_from_mapping(raw_capture_cfg)
+                capture_channel_enabled = (
+                    bool(capture_cfg.get("enabled"))
+                    and is_channel_enabled(event.source.chat_id, capture_cfg.get("channels") or [])
+                )
+            except Exception as exc:
+                logger.warning("Discord voice capture config check failed: %s", type(exc).__name__)
+                capture_cfg = None
+                capture_channel_enabled = False
+
+        capture_attempted = False
+        capture_raw_withheld = False
         enriched_parts = []
         for path in audio_paths:
             try:
@@ -14697,10 +14727,85 @@ class GatewayRunner:
                 result = await asyncio.to_thread(transcribe_audio, path)
                 if result["success"]:
                     transcript = result["transcript"]
-                    enriched_parts.append(
+                    if capture_raw_withheld:
+                        enriched_parts.append(
+                            "[The user sent an additional Discord voice attachment, but a prior "
+                            "attachment in this message matched explicit capture intent. The raw "
+                            "transcript is intentionally withheld from the normal agent path.]"
+                        )
+                        continue
+
+                    transcript_note = (
                         f'[The user sent a voice message~ '
                         f'Here\'s what they said: "{transcript}"]'
                     )
+                    if capture_channel_enabled and capture_cfg and not capture_attempted and event is not None:
+                        try:
+                            from gateway.voice_capture import maybe_enqueue_discord_voice_capture
+
+                            fallback_seed = json.dumps(
+                                {
+                                    "chat_id": getattr(event.source, "chat_id", None),
+                                    "timestamp": str(getattr(event, "timestamp", "")),
+                                    "audio_paths": audio_paths,
+                                    "content": user_text,
+                                },
+                                sort_keys=True,
+                                default=str,
+                            )
+                            stable_fallback_id = "synthetic-" + hashlib.sha256(
+                                fallback_seed.encode("utf-8")
+                            ).hexdigest()[:16]
+                            capture_message_id = (
+                                event.message_id
+                                or getattr(event.source, "message_id", None)
+                                or stable_fallback_id
+                            )
+                            decision = await asyncio.to_thread(
+                                maybe_enqueue_discord_voice_capture,
+                                message_id=capture_message_id,
+                                created_at=getattr(event, "timestamp", None),
+                                transcript=transcript,
+                                content=user_text,
+                                queue_script=capture_cfg.get("queue_script") or "",
+                                python_executable=capture_cfg.get("python_executable") or sys.executable,
+                                trigger_phrases=capture_cfg.get("trigger_phrases") or (),
+                                max_transcript_bytes=capture_cfg.get("max_transcript_bytes") or 65536,
+                            )
+                            if decision.attempted:
+                                capture_attempted = True
+                                capture_raw_withheld = True
+                            if decision.enqueued:
+                                logger.info(
+                                    "Discord voice capture enqueued: event_id=%s reason=%s queue_path=%s",
+                                    decision.event_id,
+                                    decision.reason,
+                                    decision.queue_path,
+                                )
+                                enriched_parts.append(
+                                    "[The user sent a Discord voice note that matched explicit capture "
+                                    "intent and was enqueued through the voice-capture queue. The raw "
+                                    "transcript is intentionally withheld from the normal agent path.]"
+                                )
+                                continue
+                            elif decision.attempted:
+                                logger.warning(
+                                    "Discord voice capture enqueue failed safely: event_id=%s reason=%s returncode=%s",
+                                    decision.event_id,
+                                    decision.reason,
+                                    decision.returncode,
+                                )
+                                enriched_parts.append(
+                                    "[The user sent a Discord voice note that matched explicit capture "
+                                    f"intent, but the voice-capture queue failed safely ({decision.reason}). "
+                                    "The raw transcript is intentionally withheld from the normal agent path.]"
+                                )
+                                continue
+                            else:
+                                logger.debug("Discord voice capture skipped: reason=%s", decision.reason)
+                        except Exception as exc:
+                            logger.warning("Discord voice capture enqueue raised safely: %s", type(exc).__name__)
+                    enriched_parts.append(transcript_note)
                 else:
                     error = result.get("error", "unknown error")
                     if (
@@ -14740,8 +14845,14 @@ class GatewayRunner:
             _placeholder = "(The user sent a message with no text content)"
             if user_text and user_text.strip() == _placeholder:
                 return prefix
-            if user_text:
+            if user_text and not capture_raw_withheld:
                 return f"{prefix}\n\n{user_text}"
+            if user_text and capture_raw_withheld:
+                return (
+                    f"{prefix}\n\n"
+                    "[The Discord message caption/content is intentionally withheld because "
+                    "this message matched explicit voice-capture intent.]"
+                )
             return prefix
         return user_text
 
